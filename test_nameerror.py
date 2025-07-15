@@ -1,2 +1,2 @@
 def test_undefined_variable():
-    assert price == 100
+    assert some_undefined_var == 10  # NameError

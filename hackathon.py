@@ -1,111 +1,111 @@
-# ============================================================
-# hackathon.py  (ULTRA‑ROBUST FINAL VERSION)
-# Build‑Buddy DevOps Agent – Offline auto‑fixer using CodeLlama
-# Handles ZeroDivision, wrong sums, string typos, etc.
-# ============================================================
-import sys, subprocess, os, json, datetime, re
+import subprocess
+import re
+import json
+from datetime import datetime
 from pathlib import Path
-from rich.console import Console
+import pytest
 
-# ---------------- CONFIG ----------------
-MODEL = "codellama:13b"            # or "codellama:7b-code" for speed
-TEST_DIR = Path("test_cases")
+# ---------- CONFIG ----------
+MODEL = "codellama:13b"
+TEST_FOLDER = Path("test_cases")
 LOG_FILE = Path("logs/history.json")
-LOG_FILE.parent.mkdir(exist_ok=True)
-if not LOG_FILE.exists():
-    LOG_FILE.write_text("[]")
 
-console = Console()
+# ---------- HELPERS ----------
 
-# ---------------- HELPERS --------------
-
-def log_event(file, status, summary):
-    history = json.loads(LOG_FILE.read_text())
-    history.append({
-        "file": file,
-        "status": status,
-        "summary": summary,
-        "timestamp": datetime.datetime.now().isoformat(timespec="seconds")
-    })
-    LOG_FILE.write_text(json.dumps(history, indent=2))
+def extract_diff(response):
+    match = re.search(r"```diff\n(.*?)```", response, re.DOTALL)
+    return match.group(1).strip() if match else None
 
 
-def run_pytest(path: Path):
-    res = subprocess.run(["pytest", str(path), "-q", "--tb=short", "--disable-warnings"],
-                         capture_output=True, text=True)
-    return res.returncode == 0, res.stdout
+def save_log(entry):
+    print("[LOG] Saving log entry:", entry)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not LOG_FILE.exists():
+        LOG_FILE.write_text("[]", encoding="utf-8")
+
+    try:
+        logs = json.loads(LOG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logs = []
+
+    logs.append(entry)
+    LOG_FILE.write_text(json.dumps(logs[-20:], indent=2), encoding="utf-8")
 
 
-def ask_llm(filename: str, fail_out: str) -> str:
-    prompt = f"""
+def ask_llm_strict(filename, fail_out):
+    prompt_template = f'''
 A pytest test failed.
 
-REPAIR RULES:
-1. Fix wrong expected values (e.g., `assert sum(numbers)==10` when real sum is 6).
-2. For runtime errors (like ZeroDivisionError) wrap code under test with:
-   with pytest.raises(ExpectedError): ...
-3. Return ONLY a valid unified diff patch. DO NOT include explanation text.
-4. Patch MUST modify at least one line (line starting with '+').
-FORMAT:
-```diff
---- a/{filename}
-+++ b/{filename}
-@@
-- buggy line
-+ fixed line
-```
+REPAIR RULES
+1. If failure is IndexError, fix by changing the list or guarding with
+   with pytest.raises(IndexError): …
+2. If failure is NameError, wrap the failing line in with pytest.raises(NameError): …
+3. If failure is TypeError, wrap in with pytest.raises(TypeError): …
+4. Your ENTIRE reply must be one unified-diff block. At least one
+   line must start with “+ ” (green).
+5. Zero explanation outside the ```diff block.
+
 Filename: {filename}
 Failure Output:
 {fail_out}
-"""
-    res = subprocess.run(["ollama", "run", MODEL],
-                         input=prompt, text=True, encoding="utf-8",
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
-    if res.stderr:
-        console.print("[red]LLM stderr:[/red]", res.stderr)
-    return res.stdout
+'''
+    for attempt in range(2):
+        result = subprocess.run(
+            ["ollama", "run", MODEL],
+            input=prompt_template,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=180
+        )
+        diff = extract_diff(result.stdout)
+        if diff:
+            return diff, "fixed"
+        prompt_template = (
+            f"ONLY unified diff, no words, must modify a line starting with '-':\n"
+            f"```diff\n--- a/{filename}\n+++ b/{filename}"
+        )
+    return result.stdout[:800], "analysis"
 
-
-def extract_diff(txt: str):
-    m = re.search(r"(?s)```diff(.*?)```", txt)
-    if not m:
-        return None
-    diff = m.group(1).strip()
-    # ensure at least one added line other than headers
-    return diff if re.search(r"^\+[^+].*", diff, re.MULTILINE) else None
-
-# ---------------- MAIN -----------------
+# ---------- MAIN ----------
 
 def main():
-    targets = [Path(sys.argv[1])] if len(sys.argv) > 1 else list(TEST_DIR.glob("test_*.py"))
-    if not targets:
-        console.print("[red]No tests found.[/red]"); return
+    import sys
+    file_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    files = [TEST_FOLDER / file_arg] if file_arg else list(TEST_FOLDER.glob("test_*.py"))
 
-    console.print(f"[cyan]🧠 Using LLM {MODEL}[/cyan]")
+    for test_path in files:
+        print(f"[TEST] Testing {test_path.name}")
+        result = subprocess.run([
+            "pytest", str(test_path), "--tb=short", "-q"
+        ], capture_output=True, text=True)
 
-    for t in targets:
-        console.print(f"\n🔪 Testing [yellow]{t.name}[/yellow]")
-        ok, out = run_pytest(t)
-        if ok:
-            console.print("[green]✓ Passed[/green]")
-            log_event(t.name, "passed", "No issues.")
+        output = result.stdout + result.stderr
+
+        if result.returncode == 0:
+            print("[PASS] Passed")
+            save_log({
+                "file": test_path.name,
+                "status": "passed",
+                "summary": "Test passed successfully.",
+                "timestamp": datetime.now().isoformat()
+            })
             continue
 
-        console.print("[red]❌ Failed – asking LLM…[/red]")
-        try:
-            ai = ask_llm(t.name, out)
-        except subprocess.TimeoutExpired:
-            console.print("[red]LLM timeout[/red]")
-            log_event(t.name, "timeout", "LLM timeout")
-            continue
+        print("[FAIL] Failed – asking LLM…")
+        summary, status = ask_llm_strict(test_path.name, output)
+        print("[AI-FIX] Patch detected. Logged." if status == "fixed" else "[AI-FIX] No usable diff – logged as analysis.")
 
-        diff = extract_diff(ai)
-        if diff:
-            console.print("[green]Patch captured![/green]")
-            log_event(t.name, "fixed", diff)
-        else:
-            console.print("[yellow]No usable diff – logged as analysis.[/yellow]")
-            log_event(t.name, "analysis", ai[:800])
+        save_log({
+            "file": test_path.name,
+            "status": status,
+            "summary": summary,
+            "timestamp": datetime.now().isoformat()
+        })
+
 
 if __name__ == "__main__":
     main()
+    print("[DONE] hackathon.py finished")
+    print("[LOG] Logs saved to:", LOG_FILE.resolve())

@@ -16,7 +16,6 @@ def extract_diff(response):
     match = re.search(r"```diff\n(.*?)```", response, re.DOTALL)
     return match.group(1).strip() if match else None
 
-
 def save_log(entry):
     print("[LOG] Saving log entry:", entry)
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -30,7 +29,6 @@ def save_log(entry):
 
     logs.append(entry)
     LOG_FILE.write_text(json.dumps(logs[-20:], indent=2), encoding="utf-8")
-
 
 def ask_llm_strict(filename, fail_out):
     prompt_template = f'''
@@ -103,7 +101,6 @@ def main():
             "summary": summary,
             "timestamp": datetime.now().isoformat()
         })
-
 
 if __name__ == "__main__":
     main()
